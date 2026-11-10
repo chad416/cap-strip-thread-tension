@@ -1,0 +1,15 @@
+﻿generated FB_ThreadBrake
+generated FB_WinderTension
+generated FB_LineSupervisor
+generated FB_DataCollect
+COMPILE Success  errors=0  warnings=0
+  Success  PLC_1  
+    Success  Program blocks  
+      Success  Main (OB1)  Block was successfully compiled.
+      Success  FB_ThreadBrake (FB1)  Block was successfully compiled.
+      Success  FB_WinderTension (FB2)  Block was successfully compiled.
+      Success  FB_LineSupervisor (FB3)  Block was successfully compiled.
+      Success  FB_DataCollect (FB4)  Block was successfully compiled.
+  Success    Compiling finished (errors: 0; warnings: 0)
+project: C:\TIA_captension\captension_20261110_235819\captension_20261110_235819.ap18
+

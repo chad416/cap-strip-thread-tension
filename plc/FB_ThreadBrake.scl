@@ -1,0 +1,238 @@
+FUNCTION_BLOCK "FB_ThreadBrake"
+TITLE = Unwind brake of one cord: diameter estimate, inertia feedforward, tension PI
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : chad416
+VERSION : 0.1
+//  One instance per creel position, called every OB30 cycle (10 ms).
+//  BrakeMode (from FB_LineSupervisor, DOSSIER section 3):
+//    0 Off       brake released (threading)
+//    1 OpenLoop  torque = r*Tset/Gnom - J*a/r - Mbear + Kd*(omega - v/r)   (alternative C)
+//    2 Closed    OpenLoop + tension PI on the sensor after the last guide (alternative D);
+//                falls back to OpenLoop by itself when TmeasOk = FALSE (bumpless)
+//    3 Hold      line at standstill: hold the cord at HoldFactor * set tension
+//    4 EStop     line quick stop: feedforward on the known quick-stop deceleration
+//  Radius: predicted from the consumed length (r^2 falls by Kr per metre of cord) and
+//  corrected with v/omega when that ratio is plausible; re-seeded after ReseedTime of plausible
+//  but distant readings (bobbin changed without pressing NewBobbin), with their mean.
+//  Bidirectional = TRUE turns the same block into the servo-unwind controller (alternative E).
+   VAR_INPUT
+      BrakeMode : Int;
+      LineSpeed : Real;   // m/s, capstan speed reference
+      LineAccel : Real;   // m/s2, from the ramp generator in FB_LineSupervisor
+      Omega : Real;   // rad/s, spindle encoder
+      Tmeas : Real;   // N, 3-roller sensor after the last guide
+      TmeasOk : Bool;   // analog channel status and range check
+      NewBobbin : Bool;   // operator: a full bobbin was loaded
+      Tset : Real := 15.0;   // N, recipe tension at the template entrance
+      Gnom : Real := 1.6161;   // nominal guide gain exp(mu*wrap) between bobbin and sensor
+      Rcore : Real := 0.04;   // m
+      Rfull : Real := 0.11;   // m
+      Jcore : Real := 0.0013;   // kg m2
+      Jcoef : Real := 214.9;   // pi/2 * rho_fibre * fill * width, kg/m2
+      Kr : Real := 6.98E-07;   // m2 of r^2 per metre of cord = A_cord/(pi*fill*width)
+      Mbear : Real := 0.02;   // N m
+      Kbrake : Real := 3.95;   // N m per unit current (1.0 = full scale)
+      Imax : Real := 1.0;
+      Mdrag : Real := 0.0395;   // N m residual drag at zero current
+      Bidirectional : Bool;   // TRUE: servo drive, torque may be negative
+      Kp : Real := 0.3;   // tension PI gain, N/N
+      Ti : Real := 0.8;   // s
+      Kd : Real := 9.0;   // speed damping, 2*zeta*sqrt(EA/L_eff) (N/m)^0.5
+      HoldFactor : Real := 1.0;
+      EStopDecel : Real := 2.0;   // m/s2, line quick-stop deceleration (positive)
+      RadiusTf : Real := 2.0;   // s
+      ReseedTime : Real := 1.0;   // s of consistent but distant v/omega before re-seeding
+      OmegaMin : Real := 0.5;   // rad/s
+      VMin : Real := 0.05;   // m/s
+      BrakeTau : Real := 0.025;   // s, brake torque lag (observer)
+      CycleTime : Real := 0.01;   // s
+   END_VAR
+
+   VAR_OUTPUT
+      CurrentCmd : Real;   // to the brake amplifier (0..Imax; -Imax..Imax if Bidirectional)
+      TorqueCmd : Real;   // N m
+      Radius : Real;   // m
+      RadiusOk : Bool;   // v/omega correction active this cycle
+      Inertia : Real;   // kg m2
+      Tvirtual : Real;   // N, model-based tension at the sensor location
+      TvirtualOk : Bool;
+      GuideFactor : Real;   // Tmeas / modelled bobbin tension (guide condition, valid when moving)
+      Saturated : Bool;
+      Closed : Bool;   // tension loop active
+   END_VAR
+
+   VAR
+      sR : Real := 0.11;
+      sI : Real;
+      sMest : Real;
+      sOmegaPrev : Real;
+      sAlphaF : Real;
+      sInit : Bool;
+      sBadTime : Real;
+      sLacc : Real;   // cord length since the last radius prediction step, m
+      sFarTime : Real;   // time v/omega has been more than 30 % from the estimate, s
+      sRsum : Real;   // sum of the distant v/omega readings (re-seed with their mean)
+   END_VAR
+
+   VAR_TEMP
+      tR2 : Real;
+      tRmeas : Real;
+      tTb : Real;
+      tE : Real;
+      tM : Real;
+      tMmin : Real;
+      tMmax : Real;
+      tMd : Real;
+      tUt : Real;
+      tDen : Real;
+      tA : Real;
+      tCur : Real;
+   END_VAR
+
+
+BEGIN
+	REGION Radius
+	    IF NOT #sInit OR #NewBobbin THEN
+	        #sR := #Rfull;
+	        #sInit := TRUE;
+	        #sBadTime := 0.0;
+	        #sLacc := 0.0;
+	        #sRsum := 0.0;
+	        #sFarTime := 0.0;
+	    END_IF;
+	    // prediction: r^2 falls by Kr per metre of cord taken off.  Applied once per metre: per
+	    // 10 ms the decrement of r^2 is only ~8 float32 ulps and the rounding bias summed to
+	    // +10 % radius at the end of a bobbin (DOSSIER section 13, F13).
+	    #sLacc := #sLacc + #LineSpeed * #CycleTime;
+	    IF #sLacc >= 1.0 THEN
+	        #tR2 := #sR * #sR - #Kr * #sLacc;
+	        #sLacc := 0.0;
+	        IF #tR2 > #Rcore * #Rcore THEN
+	            #sR := SQRT(#tR2);
+	        ELSE
+	            #sR := #Rcore;
+	        END_IF;
+	    END_IF;
+	    // correction: v / omega, only when both are clearly non-zero
+	    #RadiusOk := FALSE;
+	    #tRmeas := 0.0;
+	    IF #Omega > #OmegaMin AND #LineSpeed > #VMin THEN
+	        #tRmeas := #LineSpeed / #Omega;
+	        IF #tRmeas > 0.97 * #Rcore AND #tRmeas < 1.05 * #Rfull AND ABS(#tRmeas - #sR) < 0.15 * #sR THEN
+	            #sR := #sR + #CycleTime / #RadiusTf * (#tRmeas - #sR);
+	            #sBadTime := 0.0;
+	            #sRsum := 0.0;
+	            #RadiusOk := TRUE;
+	        ELSIF #tRmeas > 0.97 * #Rcore AND #tRmeas < 1.05 * #Rfull THEN
+	            // plausible size but far from the estimate: bobbin changed without NewBobbin
+	            #sBadTime := #sBadTime + #CycleTime;
+	            #sRsum := #sRsum + #tRmeas * #CycleTime;
+	            IF #sBadTime > #ReseedTime - 0.5 * #CycleTime THEN   // half a cycle: robust to float32 sums
+	                #sR := #sRsum / #sBadTime;   // mean of the readings, not the last one
+	                #sBadTime := 0.0;
+	                #sRsum := 0.0;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	    // gross mismatch timer (gates the speed-damping term)
+	    IF #tRmeas > 0.97 * #Rcore AND #tRmeas < 1.05 * #Rfull AND ABS(#tRmeas - #sR) > 0.3 * #sR THEN
+	        #sFarTime := #sFarTime + #CycleTime;
+	    ELSE
+	        #sFarTime := 0.0;
+	    END_IF;
+	    #Radius := #sR;
+	    #Inertia := #Jcore + #Jcoef * (#sR * #sR * #sR * #sR - #Rcore * #Rcore * #Rcore * #Rcore);
+	END_REGION
+
+	REGION Torque
+	    #tTb := #Tset / #Gnom;   // tension wanted at the bobbin
+	    #tE := 0.0;
+	    #tMd := 0.0;
+	    #Closed := FALSE;
+	    IF #LineSpeed > #VMin AND #Omega > #OmegaMin AND #sFarTime < 0.095 THEN
+	        // emulates a viscous brake that ties the bobbin speed to the line speed and damps the
+	        // span resonance; scheduled so the damping ratio stays constant:
+	        // c = 2*zeta*sqrt(J*k), k = EA*r^2/L  ->  c = Kd * r * sqrt(J).
+	        // It uses v/r, so it is switched off after 0.1 s of v/omega more than 30 % away from
+	        // the radius estimate (a bobbin changed without NewBobbin), until the re-seed.
+	        #tMd := #Kd * #sR * SQRT(#Inertia) * (#Omega - #LineSpeed / #sR);
+	    END_IF;
+	    // learned correction: the integral of the tension loop (zero in alternative C)
+	    #tUt := #sI;
+	    IF #BrakeMode = 1 OR #BrakeMode = 2 THEN
+	        #tM := #sR * #tTb - #Inertia * #LineAccel / #sR - #Mbear + #tMd;
+	        IF #BrakeMode = 1 THEN
+	            #tUt := 0.0;
+	        ELSIF #TmeasOk THEN
+	            #Closed := TRUE;
+	            #tE := #Tset - #Tmeas;
+	            #tUt := #Kp * #tE + #sI;
+	        END_IF;
+	    ELSIF #BrakeMode = 3 THEN
+	        #tM := #HoldFactor * #sR * #tTb;
+	    ELSIF #BrakeMode = 4 THEN
+	        IF #Omega > #OmegaMin THEN
+	            #tM := #sR * #tTb + #Inertia * #EStopDecel / #sR - #Mbear + #tMd;
+	        ELSE
+	            #tM := #HoldFactor * #sR * #tTb;
+	        END_IF;
+	    ELSE
+	        #tM := 0.0;
+	        #tUt := 0.0;
+	    END_IF;
+	    #tM := #tM + #sR / #Gnom * #tUt;
+
+	    #tMmax := #Kbrake * #Imax;
+	    IF #Bidirectional THEN
+	        #tMmin := -#tMmax;
+	    ELSE
+	        #tMmin := 0.0;
+	    END_IF;
+	    #Saturated := #tM > #tMmax OR (#tM < #tMmin AND #BrakeMode <> 0);
+	    #tM := LIMIT(MN := #tMmin, IN := #tM, MX := #tMmax);
+	    #TorqueCmd := #tM;
+
+	    // integrator: conditional integration (anti-windup) while closed; held in Hold, EStop
+	    // and after a sensor fault (it carries the learned brake-gain correction); in Off and
+	    // OpenLoop it tracks -Kp*e, so switching to Closed does not step the torque (bumpless)
+	    IF #Closed THEN
+	        IF NOT ((#tM >= #tMmax AND #tE > 0.0) OR (#tM <= #tMmin AND #tE < 0.0)) THEN
+	            #sI := #sI + #Kp * #CycleTime / #Ti * #tE;
+	            #sI := LIMIT(MN := -#Tset, IN := #sI, MX := #Tset);
+	        END_IF;
+	    ELSIF #BrakeMode = 0 OR #BrakeMode = 1 THEN
+	        IF #TmeasOk THEN
+	            #sI := -#Kp * (#Tset - #Tmeas);
+	        ELSE
+	            #sI := 0.0;
+	        END_IF;
+	    END_IF;
+
+	    IF #Bidirectional THEN
+	        #tCur := #tM / #Kbrake;
+	    ELSE
+	        #tCur := LIMIT(MN := 0.0, IN := (#tM - #Mdrag) / #Kbrake, MX := #Imax);
+	    END_IF;
+	    #CurrentCmd := #tCur;
+	END_REGION
+
+	REGION Observer
+	    // brake torque estimate: commanded torque through the brake lag, plus residual drag
+	    #tA := #CycleTime / (#BrakeTau + #CycleTime);
+	    IF #Bidirectional THEN
+	        #sMest := #sMest + #tA * (#Kbrake * #tCur - #sMest);
+	    ELSE
+	        #sMest := #sMest + #tA * (#Kbrake * #tCur + #Mdrag - #sMest);
+	    END_IF;
+	    #sAlphaF := #sAlphaF + #CycleTime / (0.05 + #CycleTime) * ((#Omega - #sOmegaPrev) / #CycleTime - #sAlphaF);
+	    #sOmegaPrev := #Omega;
+	    // torque balance on the bobbin: J*dw/dt = T*r - M - Mbear  ->  T = (M + J*dw/dt + Mbear)/r
+	    #tDen := #sMest + #Inertia * #sAlphaF + #Mbear;
+	    #TvirtualOk := #Omega > #OmegaMin;
+	    #Tvirtual := #Gnom * #tDen / #sR;
+	    #GuideFactor := 0.0;
+	    IF #TvirtualOk AND #TmeasOk AND #tDen > 0.01 THEN
+	        #GuideFactor := #Tmeas * #sR / #tDen;
+	    END_IF;
+	END_REGION
+END_FUNCTION_BLOCK

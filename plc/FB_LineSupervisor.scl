@@ -1,0 +1,212 @@
+FUNCTION_BLOCK "FB_LineSupervisor"
+TITLE = Line modes, speed ramp, brake modes, thread-break and slack detection
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : chad416
+VERSION : 0.1
+//  LineMode (DOSSIER section 3, Table 3-1):
+//    0 Idle      standstill, brakes hold the cords (BrakeMode 3)
+//    1 Jog       threading at JogSpeed, brakes open loop (BrakeMode 1)
+//    2 RampUp    start ramp to Vset                     (BrakeMode 2, or 1 without sensors)
+//    3 Run       production at Vset                     (BrakeMode 2 / 1)
+//    4 RampDown  normal stop, also the stop after a detected break
+//    5 EStop     safety relay opened: quick-stop ramp (BrakeMode 4, then 3 at standstill);
+//                left only with EStopOk AND Ack
+//    6 Fault     standstill after a thread break; left with Ack
+//  Break detection: tension below BreakFrac*Tset for BreakTime while the line moves, or the
+//  thread-break switch of that position; inhibited while the slack estimate of that position
+//  is above zero (the cord is known to be slack after an emergency stop).
+//  Slack estimate: integral of (omega*r - v) during EStop and the following restart, i.e. the
+//  cord the bobbin paid out that the capstan did not take (overrun).
+   VAR_INPUT
+      StartReq : Bool;
+      StopReq : Bool;
+      JogReq : Bool;
+      EStopOk : Bool;   // safety relay feedback, FALSE = emergency stop
+      Ack : Bool;
+      Tension : Array[1..8] of Real;   // N
+      TensionOk : Array[1..8] of Bool;
+      BreakSwitch : Array[1..8] of Bool;   // optional drop-wire thread-break detectors
+      Omega : Array[1..8] of Real;   // rad/s
+      Radius : Array[1..8] of Real;   // m, from FB_ThreadBrake
+      ClosedLoop : Bool := TRUE;   // FALSE: no tension sensors (alternative C)
+      Vset : Real := 1.0;   // m/s
+      JogSpeed : Real := 0.1;   // m/s
+      RampTime : Real := 3.0;   // s, 0 -> Vset
+      EStopTime : Real := 0.5;   // s, Vset -> 0
+      Tset : Real := 15.0;   // N
+      BreakFrac : Real := 0.2;
+      BreakTime : Real := 0.05;   // s
+      VMin : Real := 0.05;   // m/s
+      SlackMax : Real := 0.05;   // m, slack that needs an operator check before restart
+      CycleTime : Real := 0.01;   // s
+   END_VAR
+
+   VAR_OUTPUT
+      LineMode : Int;
+      SpeedRef : Real;   // m/s to the capstan drive
+      AccelRef : Real;   // m/s2
+      BrakeMode : Int;
+      WinderMode : Int;
+      BreakThread : Int;   // first position that broke (0 = none)
+      Trigger : Bool;   // one cycle: start the capture in FB_DataCollect
+      SlackFlag : Bool;   // some position paid out more than SlackMax
+      SlackLen : Array[1..8] of Real;   // m
+   END_VAR
+
+   VAR
+      sTimer : Array[1..8] of Real;
+      sEStopSeen : Bool;
+      sPrevV : Real;
+      sMode : Int;
+      sV : Real;
+      sBreak : Int;
+      sSlack : Array[1..8] of Real;
+   END_VAR
+
+   VAR_TEMP
+      i : Int;
+      tRun : Int;
+      tTarget : Real;
+      tStep : Real;
+      tBroken : Bool;
+      tMoving : Bool;
+   END_VAR
+
+
+BEGIN
+	REGION Modes
+	    #Trigger := FALSE;
+	    IF NOT #EStopOk THEN
+	        #sMode := 5;
+	        #sEStopSeen := TRUE;
+	    END_IF;
+	    IF #sMode = 5 THEN
+	        IF #EStopOk AND #Ack AND #sV <= 0.0 THEN
+	            #sMode := 0;
+	        END_IF;
+	    ELSIF #sMode = 6 THEN
+	        IF #Ack THEN
+	            #sMode := 0;
+	            #sBreak := 0;
+	        END_IF;
+	    ELSIF #sMode = 0 THEN
+	        IF #StartReq THEN
+	            #sMode := 2;
+	        ELSIF #JogReq THEN
+	            #sMode := 1;
+	        END_IF;
+	    ELSIF #sMode = 1 THEN
+	        IF NOT #JogReq THEN
+	            #sMode := 4;
+	        END_IF;
+	    ELSIF #sMode = 2 OR #sMode = 3 THEN
+	        IF #StopReq THEN
+	            #sMode := 4;
+	        END_IF;
+	    ELSIF #sMode = 4 THEN
+	        IF #sV <= 0.0 THEN
+	            IF #sBreak > 0 THEN
+	                #sMode := 6;
+	            ELSE
+	                #sMode := 0;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Ramp
+	    // ramp generator: the acceleration it outputs is the brake feedforward
+	    #tTarget := 0.0;
+	    #tStep := #Vset / #RampTime * #CycleTime;
+	    IF #sMode = 1 THEN
+	        #tTarget := #JogSpeed;
+	    ELSIF #sMode = 2 OR #sMode = 3 THEN
+	        #tTarget := #Vset;
+	    ELSIF #sMode = 5 THEN
+	        #tStep := #Vset / #EStopTime * #CycleTime;
+	    END_IF;
+	    #sPrevV := #sV;
+	    IF #sV < #tTarget THEN
+	        #sV := MIN(IN1 := #sV + #tStep, IN2 := #tTarget);
+	    ELSIF #sV > #tTarget THEN
+	        #sV := MAX(IN1 := #sV - #tStep, IN2 := #tTarget);
+	    END_IF;
+	    #AccelRef := (#sV - #sPrevV) / #CycleTime;
+	    IF #sMode = 2 AND #sV >= #Vset THEN
+	        #sMode := 3;
+	    END_IF;
+	END_REGION
+
+	REGION BrakeModes
+	    IF #ClosedLoop THEN
+	        #tRun := 2;
+	    ELSE
+	        #tRun := 1;
+	    END_IF;
+	    #tMoving := #sV > 0.0;
+	    IF #sMode = 5 THEN
+	        #BrakeMode := 4;
+	        #WinderMode := 4;
+	    ELSIF #sMode = 1 THEN
+	        #BrakeMode := 1;
+	        #WinderMode := 1;
+	    ELSIF #sMode >= 2 AND #sMode <= 4 AND #tMoving THEN
+	        #BrakeMode := #tRun;
+	        #WinderMode := 2;
+	    ELSIF #sMode = 2 THEN
+	        #BrakeMode := #tRun;
+	        #WinderMode := 2;
+	    ELSE
+	        #BrakeMode := 3;
+	        #WinderMode := 3;
+	    END_IF;
+	END_REGION
+
+	REGION SlackAndBreaks
+	    #SlackFlag := FALSE;
+	    FOR #i := 1 TO 8 DO
+	        // overrun: cord paid out by the bobbin and not taken by the capstan
+	        IF #sEStopSeen THEN
+	            #sSlack[#i] := MAX(IN1 := 0.0, IN2 := #sSlack[#i] + (#Omega[#i] * #Radius[#i] - #sV) * #CycleTime);
+	            IF #TensionOk[#i] AND #Tension[#i] > 0.3 * #Tset THEN
+	                #sSlack[#i] := 0.0;   // the sensor shows the cord is taut again
+	            END_IF;
+	        ELSE
+	            #sSlack[#i] := 0.0;
+	        END_IF;
+	        IF #sSlack[#i] > #SlackMax THEN
+	            #SlackFlag := TRUE;
+	        END_IF;
+	        // thread break
+	        #tBroken := FALSE;
+	        IF #sMode >= 2 AND #sMode <= 4 AND #sV > #VMin AND #sSlack[#i] <= 0.0 THEN
+	            IF (#TensionOk[#i] AND #Tension[#i] < #BreakFrac * #Tset) OR #BreakSwitch[#i] THEN
+	                #sTimer[#i] := #sTimer[#i] + #CycleTime;
+	            ELSE
+	                #sTimer[#i] := 0.0;
+	            END_IF;
+	            #tBroken := #sTimer[#i] >= #BreakTime;
+	        ELSE
+	            #sTimer[#i] := 0.0;
+	        END_IF;
+	        IF #tBroken AND #sBreak = 0 THEN
+	            #sBreak := #i;
+	            #Trigger := TRUE;
+	            #sMode := 4;   // stop the line on the normal ramp
+	        END_IF;
+	    END_FOR;
+	    // the e-stop episode ends once every cord is taut again (or the line is in Run)
+	    IF #sEStopSeen AND #sMode = 3 AND NOT #SlackFlag THEN
+	        #sEStopSeen := FALSE;
+	    END_IF;
+	END_REGION
+
+	REGION Outputs
+	    #LineMode := #sMode;
+	    #SpeedRef := #sV;
+	    #BreakThread := #sBreak;
+	    FOR #i := 1 TO 8 DO
+	        #SlackLen[#i] := #sSlack[#i];
+	    END_FOR;
+	END_REGION
+END_FUNCTION_BLOCK

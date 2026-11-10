@@ -1,0 +1,17 @@
+﻿generated LineIO_OB_DB
+compile before export: Success errors=0 warnings=0
+  Success  PLC_1  
+    Success  Program blocks  
+      Success  Cyclic_CapStrip (OB123)  Block was successfully compiled.
+  Success    Compiling finished (errors: 0; warnings: 0)
+generated OB attributes: Number=123 SecondaryType=ProgramCycle 
+import OK with ReadOnly=true: Cyclic_CapStrip_OB30_ro-true.xml
+imported Cyclic_CapStrip number=30 type=OB SecondaryType=CyclicInterrupt CyclicTime=100000 us
+CyclicTime set to 10000 us
+COMPILE Success  errors=0  warnings=0
+  Success  PLC_1  
+    Success  Program blocks  
+      Success  Cyclic_CapStrip (OB30)  Block was successfully compiled.
+  Success    Compiling finished (errors: 0; warnings: 0)
+project: C:\TIA_captension\captension_20261110_235819\captension_20261110_235819.ap18
+

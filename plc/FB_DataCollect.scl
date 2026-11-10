@@ -1,0 +1,201 @@
+FUNCTION_BLOCK "FB_DataCollect"
+TITLE = Ring buffer of brake and winder data, capture around a thread break, cause classification
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : chad416
+VERSION : 0.1
+//  Topic task 1: collect the data of the unwind brakes and the winder.
+//  Every call (10 ms) writes one slot of 20 channels into a 400-slot ring buffer (4 s):
+//    ch 0..7  cord tension 1..8 (N)       ch 8..15 brake current 1..8 (0..1)
+//    ch 16    strip tension (N)           ch 17    winder torque (N m)
+//    ch 18    line speed (m/s)            ch 19    line mode
+//  A rising Trigger (thread break from FB_LineSupervisor) keeps PostSamples more slots, then
+//  freezes the buffer (pre-trigger = 400 - PostSamples slots) until Release, so the HMI or an
+//  OPC UA client can read it.  At the freeze the event is classified from the PreWindow slots
+//  before the trigger (DOSSIER section 9.4):
+//    1 unwind, start-up      peak tension > PeakFactor*Tset while LineMode was 2 (RampUp)
+//    2 unwind, overrun/snatch  as 1, but slack was reported after an emergency stop
+//    3 unwind, other peak    peak tension > PeakFactor*Tset in Run or RampDown
+//    4 template              tension normal, die pressure or die temperature out of window
+//    5 cord defect or guide  everything normal: the per-position counters separate a worn
+//                            guide (one position far above the others) from cord defects
+//    0 unknown               no valid position
+//  Counters per cause and per position give the topic's "number of broken threads over a
+//  period and the cause".
+   VAR_INPUT
+      Tension : Array[1..8] of Real;
+      Current : Array[1..8] of Real;
+      Radius : Array[1..8] of Real;
+      StripTension : Real;
+      WinderTorque : Real;
+      LineSpeed : Real;
+      LineMode : Int;
+      DiePressure : Real;   // bar, crosshead
+      DieTemp : Real;   // degC, compound in the crosshead
+      Trigger : Bool;
+      TriggerThread : Int;
+      SlackFlag : Bool;
+      Release : Bool;
+      Tset : Real := 15.0;
+      PeakFactor : Real := 1.3;
+      DiePressNom : Real := 150.0;   // bar
+      DiePressDev : Real := 0.15;   // relative
+      DieTempLo : Real := 80.0;
+      DieTempHi : Real := 100.0;
+      PostSamples : Int := 100;
+      PreWindow : Int := 200;
+   END_VAR
+
+   VAR_OUTPUT
+      Frozen : Bool;
+      EventCount : DInt;
+      LastCause : Int;
+      WriteIndex : Int;
+      TriggerIndex : Int;
+   END_VAR
+
+   VAR
+      Buf : Array[0..7999] of Real;
+      EvThread : Array[0..15] of Int;
+      EvMode : Array[0..15] of Int;
+      EvCause : Array[0..15] of Int;
+      EvRadius : Array[0..15] of Real;
+      EvPeak : Array[0..15] of Real;
+      EvMean : Array[0..15] of Real;
+      EvDieP : Array[0..15] of Real;
+      EvStripPeak : Array[0..15] of Real;
+      CauseCount : Array[0..5] of DInt;
+      ThreadCount : Array[1..8] of DInt;
+      sWr : Int;
+      sPost : Int;
+      sArmed : Bool;
+      sTrigPrev : Bool;
+      sRelPrev : Bool;
+      sThread : Int;
+      sMode : Int;
+      sRadius : Real;
+      sDieP : Real;
+      sDieT : Real;
+      sSlack : Bool;
+      sEv : Int;
+      sFrozen : Bool;
+      sWrIdx : Int;
+      sTrigIdx : Int;
+      sEvCount : DInt;
+   END_VAR
+
+   VAR_TEMP
+      i : Int;
+      tBase : Int;
+      tSlot : Int;
+      tCh : Int;
+      tVal : Real;
+      tPeak : Real;
+      tSum : Real;
+      tStripPk : Real;
+      tCause : Int;
+      tDieBad : Bool;
+   END_VAR
+
+
+BEGIN
+	REGION Record
+	    IF #Release AND NOT #sRelPrev THEN
+	        #sFrozen := FALSE;
+	    END_IF;
+	    #sRelPrev := #Release;
+	    IF NOT #sFrozen THEN
+	        #tBase := #sWr * 20;
+	        FOR #i := 0 TO 7 DO
+	            #Buf[#tBase + #i] := #Tension[#i + 1];
+	            #Buf[#tBase + 8 + #i] := #Current[#i + 1];
+	        END_FOR;
+	        #Buf[#tBase + 16] := #StripTension;
+	        #Buf[#tBase + 17] := #WinderTorque;
+	        #Buf[#tBase + 18] := #LineSpeed;
+	        #Buf[#tBase + 19] := INT_TO_REAL(#LineMode);
+	        #sWrIdx := #sWr;
+	        #sWr := (#sWr + 1) MOD 400;
+	    END_IF;
+	END_REGION
+
+	REGION Trigger
+	    IF #Trigger AND NOT #sTrigPrev AND NOT #sArmed AND NOT #sFrozen THEN
+	        #sArmed := TRUE;
+	        #sPost := #PostSamples;
+	        #sTrigIdx := #sWrIdx;
+	        #sThread := #TriggerThread;
+	        #sMode := #LineMode;
+	        #sDieP := #DiePressure;
+	        #sDieT := #DieTemp;
+	        #sSlack := #SlackFlag;
+	        #sRadius := 0.0;
+	        IF #sThread >= 1 AND #sThread <= 8 THEN
+	            #sRadius := #Radius[#sThread];
+	        END_IF;
+	    END_IF;
+	    #sTrigPrev := #Trigger;
+	END_REGION
+
+	REGION Classify
+	    IF #sArmed THEN
+	        #sPost := #sPost - 1;
+	        IF #sPost <= 0 THEN
+	            #sArmed := FALSE;
+	            #sFrozen := TRUE;
+	            #tCause := 0;
+	            #tPeak := 0.0;
+	            #tSum := 0.0;
+	            #tStripPk := 0.0;
+	            IF #sThread >= 1 AND #sThread <= 8 THEN
+	                #tCh := #sThread - 1;
+	                FOR #i := 0 TO #PreWindow - 1 DO
+	                    #tSlot := (#sTrigIdx - #i + 400) MOD 400;
+	                    #tVal := #Buf[#tSlot * 20 + #tCh];
+	                    #tSum := #tSum + #tVal;
+	                    IF #tVal > #tPeak THEN
+	                        #tPeak := #tVal;
+	                    END_IF;
+	                    IF #Buf[#tSlot * 20 + 16] > #tStripPk THEN
+	                        #tStripPk := #Buf[#tSlot * 20 + 16];
+	                    END_IF;
+	                END_FOR;
+	                #tDieBad := ABS(#sDieP - #DiePressNom) > #DiePressDev * #DiePressNom
+	                    OR #sDieT < #DieTempLo OR #sDieT > #DieTempHi;
+	                IF #tPeak > #PeakFactor * #Tset THEN
+	                    IF #sSlack THEN
+	                        #tCause := 2;
+	                    ELSIF #sMode = 2 THEN
+	                        #tCause := 1;
+	                    ELSE
+	                        #tCause := 3;
+	                    END_IF;
+	                ELSIF #tDieBad THEN
+	                    #tCause := 4;
+	                ELSE
+	                    #tCause := 5;
+	                END_IF;
+	                #ThreadCount[#sThread] := #ThreadCount[#sThread] + 1;
+	            END_IF;
+	            #EvThread[#sEv] := #sThread;
+	            #EvMode[#sEv] := #sMode;
+	            #EvCause[#sEv] := #tCause;
+	            #EvRadius[#sEv] := #sRadius;
+	            #EvPeak[#sEv] := #tPeak;
+	            #EvMean[#sEv] := #tSum / INT_TO_REAL(MAX(IN1 := #PreWindow, IN2 := 1));
+	            #EvDieP[#sEv] := #sDieP;
+	            #EvStripPeak[#sEv] := #tStripPk;
+	            #sEv := (#sEv + 1) MOD 16;
+	            #CauseCount[#tCause] := #CauseCount[#tCause] + 1;
+	            #sEvCount := #sEvCount + 1;
+	            #LastCause := #tCause;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Outputs
+	    #Frozen := #sFrozen;
+	    #WriteIndex := #sWrIdx;
+	    #TriggerIndex := #sTrigIdx;
+	    #EventCount := #sEvCount;
+	END_REGION
+END_FUNCTION_BLOCK

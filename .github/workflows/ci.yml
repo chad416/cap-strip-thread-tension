@@ -1,0 +1,16 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .[test]
+      - name: SCL sources translate (the TIA build itself needs Windows + TIA Portal)
+        run: python -c "import glob; from captension import scl; print(sorted(scl.load(sorted(glob.glob('plc/FB_*.scl')))))"
+      - name: Unit tests, physics and SCL equivalence (float32 Real)
+        run: python -m pytest -q

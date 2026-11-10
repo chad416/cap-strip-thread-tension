@@ -1,0 +1,118 @@
+FUNCTION_BLOCK "FB_WinderTension"
+TITLE = Strip winder: recipe tension with hyperbolic taper, inertia feedforward, load-cell trim
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : chad416
+VERSION : 0.1
+//  WinderMode: 0 Off, 1 Run (feedforward only), 2 Run + load-cell PI, 3 Hold (standstill),
+//              4 EStop (feedforward on the line quick-stop deceleration).
+//  Tension reference with hyperbolic taper (DOSSIER section 8.6):
+//      Tref = Trecipe * (1 - Taper * (1 - Rcore / R))
+//  Torque to the winder drive:  M = Tref*R + J(R)*a/R + Mfric + R*(Kp*e + I) - Kd*R*sqrt(J)*(w - v/R)
+//  The last term damps the strip-span resonance (the drive alone has no speed feedback here).
+   VAR_INPUT
+      WinderMode : Int;
+      LineSpeed : Real;   // m/s
+      LineAccel : Real;   // m/s2
+      OmegaW : Real;   // rad/s, winder motor speed referred to the spool
+      StripT : Real;   // N, load cell on the measuring roller
+      StripTOk : Bool;
+      NewSpool : Bool;
+      Trecipe : Real := 40.0;   // N
+      Taper : Real := 0.2;   // fraction at the full spool
+      Rcore : Real := 0.1;   // m
+      Rmax : Real := 0.166;   // m
+      Jcore : Real := 0.1;   // kg m2
+      Jcoef : Real := 457.0;   // pi/2 * wound density * spool width * fill
+      Mfric : Real := 0.5;   // N m
+      Kp : Real := 0.5;
+      Kd : Real := 40.0;   // speed damping 2*zeta*sqrt(EA_strip/L_span), (N/m)^0.5
+      Ti : Real := 0.8;   // s
+      Mmax : Real := 30.0;   // N m
+      EStopDecel : Real := 2.0;   // m/s2
+      RadiusTf : Real := 2.0;   // s
+      OmegaMin : Real := 0.3;   // rad/s
+      VMin : Real := 0.05;   // m/s
+      CycleTime : Real := 0.01;   // s
+   END_VAR
+
+   VAR_OUTPUT
+      TorqueCmd : Real;   // N m to the winder drive (torque mode)
+      Radius : Real;   // m
+      Tref : Real;   // N, tapered tension reference
+      Saturated : Bool;
+   END_VAR
+
+   VAR
+      sR : Real := 0.1;
+      sI : Real;
+      sInit : Bool;
+   END_VAR
+
+   VAR_TEMP
+      tRm : Real;
+      tJ : Real;
+      tAcc : Real;
+      tE : Real;
+      tUt : Real;
+      tM : Real;
+      tPi : Bool;
+      tMd : Real;
+   END_VAR
+
+
+BEGIN
+	REGION Radius
+	    IF NOT #sInit OR #NewSpool THEN
+	        #sR := #Rcore;
+	        #sInit := TRUE;
+	    END_IF;
+	    IF #OmegaW > #OmegaMin AND #LineSpeed > #VMin THEN
+	        #tRm := #LineSpeed / #OmegaW;
+	        IF #tRm > 0.95 * #Rcore AND #tRm < 1.05 * #Rmax THEN
+	            #sR := #sR + #CycleTime / #RadiusTf * (#tRm - #sR);
+	        END_IF;
+	    END_IF;
+	    #Radius := #sR;
+	    #tJ := #Jcore + #Jcoef * (#sR * #sR * #sR * #sR - #Rcore * #Rcore * #Rcore * #Rcore);
+	    #Tref := #Trecipe * (1.0 - #Taper * (1.0 - #Rcore / #sR));
+	END_REGION
+
+	REGION Torque
+	    IF #WinderMode = 4 THEN
+	        #tAcc := -#EStopDecel;
+	    ELSE
+	        #tAcc := #LineAccel;
+	    END_IF;
+	    #tE := 0.0;
+	    IF #StripTOk THEN
+	        #tE := #Tref - #StripT;
+	    END_IF;
+	    #tPi := #WinderMode = 2 AND #StripTOk;
+	    IF #tPi THEN
+	        #tUt := #Kp * #tE + #sI;
+	    ELSE
+	        #tUt := #sI;
+	    END_IF;
+	    #tMd := 0.0;
+	    IF #LineSpeed > #VMin THEN
+	        #tMd := #Kd * #sR * SQRT(#tJ) * (#OmegaW - #LineSpeed / #sR);
+	    END_IF;
+	    IF #WinderMode = 1 OR #WinderMode = 2 OR #WinderMode = 4 THEN
+	        #tM := #Tref * #sR + #tJ * #tAcc / #sR + #Mfric + #sR * #tUt - #tMd;
+	    ELSIF #WinderMode = 3 THEN
+	        #tM := #Tref * #sR;
+	    ELSE
+	        #tM := 0.0;
+	    END_IF;
+	    #Saturated := #tM > #Mmax OR #tM < -#Mmax;
+	    #tM := LIMIT(MN := -#Mmax, IN := #tM, MX := #Mmax);
+	    IF #tPi AND NOT ((#tM >= #Mmax AND #tE > 0.0) OR (#tM <= -#Mmax AND #tE < 0.0)) THEN
+	        #sI := #sI + #Kp * #CycleTime / #Ti * #tE;
+	        #sI := LIMIT(MN := -#Trecipe, IN := #sI, MX := #Trecipe);
+	    END_IF;
+	    IF #WinderMode = 0 THEN
+	        #sI := 0.0;
+	    END_IF;
+	    #TorqueCmd := #tM;
+	END_REGION
+END_FUNCTION_BLOCK
